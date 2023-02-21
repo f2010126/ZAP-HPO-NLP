@@ -18,7 +18,7 @@ Notes and discussions are kept in [My Obsidian Vault](https://github.com/f201012
 |        Using the embeddings      |  emeddings of the datasets and how it will be stored/used  | Estimate |
 |       Define Benchmarks       | What to compare against | 3-5 days |
 |       Hyperparameter space definition       | use one from the vision domain plus specific to language | 3-5 days |
-|       Create the cost matrix - mini 1 model, 2datasets       | Get end to end implementation on small scale | 3-5 weeks |
+|       Create the cost matrix - mini 1 model, 2datasets       | Get end to end implementation on small scale | 4-6 weeks |
 |       Create the cost matrix - full      | Why | 1 week |
 |       Generate the dataset for the surrogate model.      | given the cost matrix, the HPO configs of the pipelines and the dataset embeddings, generate the metadata dataset | 3-5 days |
 |       Training surrogate model choice loss function     | Why | Estimate |
@@ -73,3 +73,4 @@ Idea: use the same ones as DBMDZ (77.852 ± 0.60 F1)
 1. GPU, cluster training feels slow.
 2. Errors with ZAP upgrade
 3. BOHB feels very slow. What options am I not setting?
+4. How to use the embeddings?
