@@ -1,110 +1,188 @@
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
+import argparse
+
+import evaluate
 import torch
-from transformers import TrainingArguments, Trainer
-from transformers import BertTokenizer, BertForSequenceClassification
-from transformers import EarlyStoppingCallback
+from datasets import load_dataset
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
-# Read data
-data = pd.read_csv("IMDB_Dataset.csv")
+from accelerate import Accelerator, DistributedType
 
-# Create torch dataset
-class Dataset(torch.utils.data.Dataset):
-    def __init__(self, encodings, labels=None):
-        self.encodings = encodings
-        self.labels = labels
+########################################################################
+# This is a fully working simple example to use Accelerate
+#
+# This example trains a Bert base model on GLUE MRPC
+# in any of the following settings (with the same script):
+#   - single CPU or single GPU
+#   - multi GPUS (using PyTorch distributed mode)
+#   - (multi) TPUs
+#   - fp16 (mixed-precision) or fp32 (normal precision)
+#
+# To run it in each of these various modes, follow the instructions
+# in the readme for examples:
+# https://github.com/huggingface/accelerate/tree/main/examples
+#
+########################################################################
 
-    def __getitem__(self, idx):
-        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
-        if self.labels:
-            item["labels"] = torch.tensor(self.labels[idx])
-        return item
+MAX_GPU_BATCH_SIZE = 16
+EVAL_BATCH_SIZE = 32
 
-    def __len__(self):
-        return len(self.encodings["input_ids"])
 
-# Define metrics
-def compute_metrics(p):
-    pred, labels = p
-    pred = np.argmax(pred, axis=1)
+def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
+    """
+    Creates a set of `DataLoader`s for the `glue` dataset,
+    using "bert-base-cased" as the tokenizer.
+    Args:
+        accelerator (`Accelerator`):
+            An `Accelerator` object
+        batch_size (`int`, *optional*):
+            The batch size for the train and validation DataLoaders.
+    """
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
+    datasets = load_dataset("glue", "mrpc")
 
-    accuracy = accuracy_score(y_true=labels, y_pred=pred)
-    recall = recall_score(y_true=labels, y_pred=pred)
-    precision = precision_score(y_true=labels, y_pred=pred)
-    f1 = f1_score(y_true=labels, y_pred=pred)
+    def tokenize_function(examples):
+        # max_length=None => use the model max length (it's actually the default)
+        outputs = tokenizer(examples["sentence1"], examples["sentence2"], truncation=True, max_length=None)
+        return outputs
 
-    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+    # Apply the method we just defined to all the examples in all the splits of the dataset
+    # starting with the main process first:
+    with accelerator.main_process_first():
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["idx", "sentence1", "sentence2"],
+        )
 
-def setup_pipeline():
-    # Define pretrained tokenizer and model
-    model_name = "bert-base-uncased"
-    tokenizer = BertTokenizer.from_pretrained(model_name)
-    model = BertForSequenceClassification.from_pretrained(model_name, num_labels=2)
+    # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
+    # transformers library
+    tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
 
-    # ----- 1. Preprocess data -----#
-    # Preprocess data
-    X = list(data["review"])
-    y = list(data["sentiment"])
-    y = [1 if label == "positive" else 0 for label in y]
-    # run train_test_split twice to create train, validation, and test sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=1)
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train, test_size=0.25, random_state=1)
+    def collate_fn(examples):
+        # On TPU it's best to pad everything to the same length or training will be very slow.
+        max_length = 128 if accelerator.distributed_type == DistributedType.TPU else None
+        # When using mixed precision we want round multiples of 8/16
+        if accelerator.mixed_precision == "fp8":
+            pad_to_multiple_of = 16
+        elif accelerator.mixed_precision != "no":
+            pad_to_multiple_of = 8
+        else:
+            pad_to_multiple_of = None
 
-    X_train_tokenized = tokenizer(X_train, padding=True, truncation=True, max_length=512)
-    X_val_tokenized = tokenizer(X_val, padding=True, truncation=True, max_length=512)
+        return tokenizer.pad(
+            examples,
+            padding="longest",
+            max_length=max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_tensors="pt",
+        )
 
-    train_dataset = Dataset(X_train_tokenized, y_train)
-    val_dataset = Dataset(X_val_tokenized, y_val)
-    # ----- 2. Fine-tune pretrained model -----#
-    # Define Trainer parameters
-
-    # Define Trainer
-    args = TrainingArguments(
-        output_dir="output",
-        evaluation_strategy="steps",
-        eval_steps=500,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        num_train_epochs=1,
-        seed=0,
-        load_best_model_at_end=True,
+    # Instantiate dataloaders.
+    train_dataloader = DataLoader(
+        tokenized_datasets["train"], shuffle=True, collate_fn=collate_fn, batch_size=batch_size
     )
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+    eval_dataloader = DataLoader(
+        tokenized_datasets["validation"], shuffle=False, collate_fn=collate_fn, batch_size=EVAL_BATCH_SIZE
     )
 
-    # Train pre-trained model
-    trainer.train()
+    return train_dataloader, eval_dataloader
 
-    # ----- 3. Predict -----#
-    # Load test data
 
-    X_test_tokenized = tokenizer(X_test, padding=True, truncation=True, max_length=512)
-    # Create torch dataset
-    test_dataset = Dataset(X_test_tokenized)
-    # Load trained model
-    model_path = "output/checkpoint-50000"
-    model = BertForSequenceClassification.from_pretrained(model_path, num_labels=2)
+def training_function(config, args):
+    # Initialize accelerator
+    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
+    # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
+    lr = config["lr"]
+    num_epochs = int(config["num_epochs"])
+    seed = int(config["seed"])
+    batch_size = int(config["batch_size"])
 
-    # Define test trainer
-    test_trainer = Trainer(model)
+    metric = evaluate.load("glue", "mrpc")
 
-    # Make prediction
-    raw_pred, _, _ = test_trainer.predict(test_dataset)
+    # If the batch size is too big we use gradient accumulation
+    gradient_accumulation_steps = 1
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
+        gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
+        batch_size = MAX_GPU_BATCH_SIZE
 
-    # Preprocess raw predictions
-    y_pred = np.argmax(raw_pred, axis=1)
-    print("Accuracy: ", accuracy_score(y_true=y_test, y_pred=y_pred))
+    set_seed(seed)
+    train_dataloader, eval_dataloader = get_dataloaders(accelerator, batch_size)
+    # Instantiate the model (we build the model here so that the seed also control new weights initialization)
+    model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", return_dict=True)
+
+    # We could avoid this line since the accelerator is set with `device_placement=True` (default value).
+    # Note that if you are placing tensors on devices manually, this line absolutely needs to be before the optimizer
+    # creation otherwise training will not work on TPU (`accelerate` will kindly throw an error to make us aware of that).
+    model = model.to(accelerator.device)
+    # Instantiate optimizer
+    optimizer = AdamW(params=model.parameters(), lr=lr)
+
+    # Instantiate scheduler
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=100,
+        num_training_steps=(len(train_dataloader) * num_epochs) // gradient_accumulation_steps,
+    )
+
+    # Prepare everything
+    # There is no specific order to remember, we just need to unpack the objects in the same order we gave them to the
+    # prepare method.
+
+    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    )
+
+    # Now we train the model
+    for epoch in range(num_epochs):
+        model.train()
+        for step, batch in enumerate(train_dataloader):
+            # We could avoid this line since we set the accelerator with `device_placement=True`.
+            batch.to(accelerator.device)
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss = loss / gradient_accumulation_steps
+            accelerator.backward(loss)
+            if step % gradient_accumulation_steps == 0:
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+        model.eval()
+        for step, batch in enumerate(eval_dataloader):
+            # We could avoid this line since we set the accelerator with `device_placement=True`.
+            batch.to(accelerator.device)
+            with torch.no_grad():
+                outputs = model(**batch)
+            predictions = outputs.logits.argmax(dim=-1)
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
+            metric.add_batch(
+                predictions=predictions,
+                references=references,
+            )
+
+        eval_metric = metric.compute()
+        # Use accelerator.print to print only on the main process.
+        accelerator.print(f"epoch {epoch}:", eval_metric)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Simple example of training script.")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16", "fp8"],
+        help="Whether to use mixed precision. Choose"
+             "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
+             "and an Nvidia Ampere GPU.",
+    )
+    parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
+    args = parser.parse_args()
+    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
+    training_function(config, args)
 
 
 if __name__ == "__main__":
-    setup_pipeline()
+    main()
