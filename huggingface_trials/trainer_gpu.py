@@ -1,6 +1,7 @@
 import argparse
 from tqdm import tqdm
 import evaluate
+import wandb
 import torch
 from datasets import load_dataset
 from torch.optim import AdamW
@@ -25,11 +26,11 @@ from accelerate import Accelerator, DistributedType
 #
 ########################################################################
 
-MAX_GPU_BATCH_SIZE = 16
-EVAL_BATCH_SIZE = 32
+MAX_GPU_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 16
 
 
-def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
+def get_dataloaders(accelerator: Accelerator, batch_size: int = 8):
     """
     Creates a set of `DataLoader`s for the `amazon` dataset,
     using "bert-base-cased" as the tokenizer.
@@ -102,13 +103,29 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
 
 def training_function(config, args):
     # Initialize accelerator
-    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
+    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision,log_with="wandb")
+    accelerator.init_trackers(
+        "TestNLPWandb",
+        config=config,
+        init_kwargs={
+            "wandb": {
+                "notes": "testing accelerate pipeline",
+                "tags": ["tag_a", "tag_b"],
+                "entity": "gladiator",
+            }
+        },
+    )
+
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
+    model_name = config["model_name"]
+    dataset_name = config["dataset_name"]
+    experiment_name = config["exp_name"]
 
+    # use the same metric as GLUE
     metric = evaluate.load("glue", "mrpc")
 
     # If the batch size is too big we use gradient accumulation
@@ -118,12 +135,13 @@ def training_function(config, args):
         batch_size = MAX_GPU_BATCH_SIZE
 
     print('Setting up')
+    # Helper function for reproducible behavior to set the seed in random, numpy, torch and/or tf
     set_seed(seed)
     train_dataloader, eval_dataloader = get_dataloaders(accelerator, batch_size)
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
-    config = AutoConfig.from_pretrained(
-        "bert-base-cased", num_labels=5)
-    model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", config=config)
+    model_config = AutoConfig.from_pretrained(
+        model_name, num_labels=5)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, config=model_config)
 
     # We could avoid this line since the accelerator is set with `device_placement=True` (default value).
     # Note that if you are placing tensors on devices manually, this line absolutely needs to be before the optimizer
@@ -147,21 +165,25 @@ def training_function(config, args):
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
+
     # Now we train the model
     print('Training')
     for epoch in range(num_epochs):
         model.train()
-        for step, batch in tqdm(enumerate(train_dataloader)):
-            # We could avoid this line since we set the accelerator with `device_placement=True`.
-            batch.to(accelerator.device)
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss = loss / gradient_accumulation_steps
-            accelerator.backward(loss)
-            if step % gradient_accumulation_steps == 0:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+        with tqdm(total=100, bar_format="{l_bar}{bar} [ time left: {remaining}, time spent: {elapsed}]") as pbar:
+            for step, batch in tqdm(enumerate(train_dataloader)):
+                # We could avoid this line since we set the accelerator with `device_placement=True`.
+                batch.to(accelerator.device)
+                outputs = model(**batch)
+                loss = outputs.loss
+                loss = loss / gradient_accumulation_steps
+                accelerator.log({"train_loss": loss}, step=step)
+                accelerator.backward(loss)
+                if step % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+
 
         model.eval()
         for step, batch in tqdm(enumerate(eval_dataloader)):
@@ -177,8 +199,11 @@ def training_function(config, args):
             )
 
         eval_metric = metric.compute()
+        accelerator.log({"eval_metric": eval_metric}, step=epoch)
         # Use accelerator.print to print only on the main process.
         accelerator.print(f"epoch {epoch}:", eval_metric)
+
+    accelerator.end_training()
 
 
 def main():
@@ -194,8 +219,12 @@ def main():
     )
     # store_true sets default value of False is used to test the script on CPU
     parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
+    parser.add_argument("--model_name", type=str, help="Name of the model to train.", default="bert-base-cased")
+    parser.add_argument("--dataset_name", type=str, help="Name of the dataset to train.", default="amazon_reviews_multi")
+    parser.add_argument("--exp_name", type=str, help="Name of WANDDB experiment.", default="test-pipeline")
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 1, "seed": 42, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 1, "seed": 42, "batch_size": 8,
+              "model_name": args.model_name, "dataset_name": args.dataset_name, "exp_name": args.exp_name}
     training_function(config, args)
 
 
