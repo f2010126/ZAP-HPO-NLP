@@ -1,11 +1,11 @@
 import argparse
-
+from tqdm import tqdm
 import evaluate
 import torch
 from datasets import load_dataset
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed,AutoConfig
 
 from accelerate import Accelerator, DistributedType
 
@@ -31,7 +31,7 @@ EVAL_BATCH_SIZE = 32
 
 def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
     """
-    Creates a set of `DataLoader`s for the `glue` dataset,
+    Creates a set of `DataLoader`s for the `amazon` dataset,
     using "bert-base-cased" as the tokenizer.
     Args:
         accelerator (`Accelerator`):
@@ -40,25 +40,35 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
             The batch size for the train and validation DataLoaders.
     """
     tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
-    datasets = load_dataset("glue", "mrpc")
+    datasets = load_dataset("amazon_reviews_multi", 'en',)
 
+    # Combine review title and body. Update stars to go from 1-5 to 0-4
+    def prep_data(example):
+        example['review_body'] = ["{} {}".format(title, review) for title, review in zip(example['review_title'], example['review_body'])]
+        example['stars'] = [int(star) - 1 for star in example['stars']]
+        return example
     def tokenize_function(examples):
         # max_length=None => use the model max length (it's actually the default)
-        outputs = tokenizer(examples["sentence1"], examples["sentence2"], truncation=True, max_length=None)
+        outputs = tokenizer(examples["review_body"], truncation=True, max_length=None)
         return outputs
 
     # Apply the method we just defined to all the examples in all the splits of the dataset
     # starting with the main process first:
     with accelerator.main_process_first():
+        datasets = datasets.map(prep_data, batched=True, num_proc=4, remove_columns=['review_title'])
+        # We use the `map` method to apply the function to all the examples in the dataset
         tokenized_datasets = datasets.map(
             tokenize_function,
+            num_proc=4,
             batched=True,
-            remove_columns=["idx", "sentence1", "sentence2"],
+            remove_columns=["review_id", 'language', 'reviewer_id', 'product_id',
+                            'review_body','product_category'],
         )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
-    tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
+    tokenized_datasets = tokenized_datasets.rename_column("stars", "labels")
+    print('dataset loaded')
 
     def collate_fn(examples):
         # On TPU it's best to pad everything to the same length or training will be very slow.
@@ -107,10 +117,13 @@ def training_function(config, args):
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
+    print('Setting up')
     set_seed(seed)
     train_dataloader, eval_dataloader = get_dataloaders(accelerator, batch_size)
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
-    model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", return_dict=True)
+    config = AutoConfig.from_pretrained(
+        "bert-base-cased", num_labels=5)
+    model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", config=config)
 
     # We could avoid this line since the accelerator is set with `device_placement=True` (default value).
     # Note that if you are placing tensors on devices manually, this line absolutely needs to be before the optimizer
@@ -129,15 +142,16 @@ def training_function(config, args):
     # Prepare everything
     # There is no specific order to remember, we just need to unpack the objects in the same order we gave them to the
     # prepare method.
-
+    print('Preparing')
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
     # Now we train the model
+    print('Training')
     for epoch in range(num_epochs):
         model.train()
-        for step, batch in enumerate(train_dataloader):
+        for step, batch in tqdm(enumerate(train_dataloader)):
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch.to(accelerator.device)
             outputs = model(**batch)
@@ -150,7 +164,7 @@ def training_function(config, args):
                 optimizer.zero_grad()
 
         model.eval()
-        for step, batch in enumerate(eval_dataloader):
+        for step, batch in tqdm(enumerate(eval_dataloader)):
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch.to(accelerator.device)
             with torch.no_grad():
@@ -178,9 +192,10 @@ def main():
              "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
              "and an Nvidia Ampere GPU.",
     )
+    # store_true sets default value of False is used to test the script on CPU
     parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 1, "seed": 42, "batch_size": 16}
     training_function(config, args)
 
 
