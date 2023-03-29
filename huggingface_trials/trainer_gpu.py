@@ -6,7 +6,8 @@ import torch
 from datasets import load_dataset
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed,AutoConfig
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed, \
+    AutoConfig
 
 from accelerate import Accelerator, DistributedType
 
@@ -30,7 +31,8 @@ MAX_GPU_BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 16
 
 
-def get_dataloaders(accelerator: Accelerator, batch_size: int = 8):
+def get_dataloaders(accelerator: Accelerator, batch_size: int = 8, model_name = 'bert-base-german-cased',
+                    dataset="amazon_reviews_multi", split="de"):
     """
     Creates a set of `DataLoader`s for the `amazon` dataset,
     using "bert-base-cased" as the tokenizer.
@@ -39,15 +41,24 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 8):
             An `Accelerator` object
         batch_size (`int`, *optional*):
             The batch size for the train and validation DataLoaders.
+        model_name (`str`, *optional*):
+            The name of the model to use for tokenization.
+        dataset_name (`str`, *optional*):
+            The name of the dataset to use.
+        split (`str`, *optional*):
+            The name of the split to use. Usually is the language,
+            but can be a subset of the dataset. It's not the same as test/train/val.
     """
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
-    datasets = load_dataset("amazon_reviews_multi", 'en',)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    datasets = load_dataset(dataset, split, )
 
     # Combine review title and body. Update stars to go from 1-5 to 0-4
     def prep_data(example):
-        example['review_body'] = ["{} {}".format(title, review) for title, review in zip(example['review_title'], example['review_body'])]
+        example['review_body'] = ["{} {}".format(title, review) for title, review in
+                                  zip(example['review_title'], example['review_body'])]
         example['stars'] = [int(star) - 1 for star in example['stars']]
         return example
+
     def tokenize_function(examples):
         # max_length=None => use the model max length (it's actually the default)
         outputs = tokenizer(examples["review_body"], truncation=True, max_length=None)
@@ -63,7 +74,7 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 8):
             num_proc=4,
             batched=True,
             remove_columns=["review_id", 'language', 'reviewer_id', 'product_id',
-                            'review_body','product_category'],
+                            'review_body', 'product_category'],
         )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
@@ -98,24 +109,16 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 8):
         tokenized_datasets["validation"], shuffle=False, collate_fn=collate_fn, batch_size=EVAL_BATCH_SIZE
     )
 
-    return train_dataloader, eval_dataloader
+    test_dataloader = DataLoader(
+        tokenized_datasets["test"], shuffle=False, collate_fn=collate_fn, batch_size=EVAL_BATCH_SIZE
+    )
+
+    return train_dataloader, eval_dataloader, test_dataloader
 
 
 def training_function(config, args):
     # Initialize accelerator
-    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision,log_with="wandb")
-    accelerator.init_trackers(
-        "TestNLPWandb",
-        config=config,
-        init_kwargs={
-            "wandb": {
-                "notes": "testing accelerate pipeline",
-                "tags": ["tag_a", "tag_b"],
-                "entity": "gladiator",
-            }
-        },
-    )
-
+    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision, log_with="wandb")
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
@@ -124,9 +127,8 @@ def training_function(config, args):
     model_name = config["model_name"]
     dataset_name = config["dataset_name"]
     experiment_name = config["exp_name"]
-
-    # use the same metric as GLUE
-    metric = evaluate.load("glue", "mrpc")
+    group = config["wandb_group"]
+    job_type = config["wandb_job"]
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
@@ -134,10 +136,25 @@ def training_function(config, args):
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
+    config['grad_acc'] = gradient_accumulation_steps
+
+    accelerator.init_trackers(
+            experiment_name,
+            config=args,
+            init_kwargs={
+                "wandb": {
+                    "notes": "testing accelerate pipeline",
+                    "group": group,
+                    "job_type": job_type,
+                    "entity": "insane_gupta",  # wandb username
+                }
+            },
+        )
+
     print('Setting up')
     # Helper function for reproducible behavior to set the seed in random, numpy, torch and/or tf
     set_seed(seed)
-    train_dataloader, eval_dataloader = get_dataloaders(accelerator, batch_size)
+    train_dataloader, eval_dataloader, test_dataloader = get_dataloaders(accelerator, batch_size, model_name=model_name, dataset=dataset_name, split=args.split_lang)
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
     model_config = AutoConfig.from_pretrained(
         model_name, num_labels=5)
@@ -148,7 +165,7 @@ def training_function(config, args):
     # creation otherwise training will not work on TPU (`accelerate` will kindly throw an error to make us aware of that).
     model = model.to(accelerator.device)
     # Instantiate optimizer
-    optimizer = AdamW(params=model.parameters(), lr=lr)
+    optimizer = AdamW(params=model.parameters(), lr=lr, betas=(0.9,0.999), eps=1e-8, weight_decay=0.01)
 
     # Instantiate scheduler
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -160,31 +177,46 @@ def training_function(config, args):
     # Prepare everything
     # There is no specific order to remember, we just need to unpack the objects in the same order we gave them to the
     # prepare method.
-    print('Preparing')
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    print('Preparing with Accelerate')
+    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader,test_dataloader, lr_scheduler
     )
-
-
+    # Instantiate training metrics
+    metric = evaluate.load("f1")
+    train_acc = evaluate.load("accuracy")
+    train_f1 = evaluate.load("f1")
     # Now we train the model
     print('Training')
     for epoch in range(num_epochs):
+        # Training
         model.train()
         with tqdm(total=100, bar_format="{l_bar}{bar} [ time left: {remaining}, time spent: {elapsed}]") as pbar:
+
             for step, batch in tqdm(enumerate(train_dataloader)):
                 # We could avoid this line since we set the accelerator with `device_placement=True`.
                 batch.to(accelerator.device)
                 outputs = model(**batch)
+                # Calculate the loss, accuracy and f1 score
+                predictions = outputs.logits.argmax(dim=-1)
+                # gather accross all processes
+                predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
+                train_acc.add_batch(predictions=predictions, references=references)
+                train_f1.add_batch(predictions=predictions, references=references)
+                # loss isnt gathered because we do it manually via gradient accumulation?
                 loss = outputs.loss
                 loss = loss / gradient_accumulation_steps
+                # Log the loss and metrics
                 accelerator.log({"train_loss": loss}, step=step)
+                if step % 10 == 0:
+                    accelerator.log({"train_acc": train_acc.compute()['accuracy'],
+                                     "train_f1": train_f1.compute(average="weighted")['f1']}, step=step)
                 accelerator.backward(loss)
                 if step % gradient_accumulation_steps == 0:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
 
-
+        # Validation
         model.eval()
         for step, batch in tqdm(enumerate(eval_dataloader)):
             # We could avoid this line since we set the accelerator with `device_placement=True`.
@@ -198,16 +230,33 @@ def training_function(config, args):
                 references=references,
             )
 
-        eval_metric = metric.compute()
+        eval_metric = round(metric.compute(average="weighted")['f1'],5)
         accelerator.log({"eval_metric": eval_metric}, step=epoch)
         # Use accelerator.print to print only on the main process.
         accelerator.print(f"epoch {epoch}:", eval_metric)
 
+    print('Testing')
+    metric = evaluate.load("f1")
+    model.eval()
+    for step, batch in tqdm(enumerate(test_dataloader)):
+        batch.to(accelerator.device)
+        with torch.no_grad():
+            outputs = model(**batch)
+        predictions = outputs.logits.argmax(dim=-1)
+        predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
+        metric.add_batch(
+            predictions=predictions,
+            references=references,
+        )
+    eval_metric = round(metric.compute(average="weighted")['f1'], 5)
+    accelerator.log({"test_metric": eval_metric}, step=epoch)
+    # Use accelerator.print to print only on the main process.
     accelerator.end_training()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Simple example of training script.")
+    # Distrubuted training parameters
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -219,12 +268,27 @@ def main():
     )
     # store_true sets default value of False is used to test the script on CPU
     parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
-    parser.add_argument("--model_name", type=str, help="Name of the model to train.", default="bert-base-cased")
-    parser.add_argument("--dataset_name", type=str, help="Name of the dataset to train.", default="amazon_reviews_multi")
+    # Training Hyperparameters
+    parser.add_argument("--num_epochs", type=int, help="Number of epochs to train. Default is 3.", default=3)
+    parser.add_argument("--batch_size", type=int, help="Batch size to train. Default is 32.", default=32)
+    parser.add_argument("--lr", type=float, help="Learning rate to train. Default is 2e-5.", default=2e-5)
+    parser.add_argument("--seed", type=int, help="Seed to use. Default is 42.", default=42)
+    # Model and dataset parameters
+    parser.add_argument("--model_name", type=str, help="Name of the model to train. Default is bert-base-german-cased", default="bert-base-german-cased")
+    parser.add_argument("--dataset_name", type=str, help="Name of the dataset to train. Default is amazon_reviews_multi.",
+                        default="amazon_reviews_multi")
+    parser.add_argument("--split-lang",type=str,default='de',help='Language split of data to use.Deafult is German ')
+    # Logging parameters
     parser.add_argument("--exp_name", type=str, help="Name of WANDDB experiment.", default="test-pipeline")
+    parser.add_argument("--group_name", type=str, help="Name of WANDDB group.", default="BERT")
+    parser.add_argument("--job_name", type=str, help="Name of WANDDB job.", default="8GPU")
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 1, "seed": 42, "batch_size": 8,
-              "model_name": args.model_name, "dataset_name": args.dataset_name, "exp_name": args.exp_name}
+    config = {"lr": args.lr, "num_epochs": args.num_epochs, "seed": args.seed, "batch_size": args.batch_size,
+              "model_name": args.model_name,
+              "dataset_name": args.dataset_name,
+              "exp_name": args.exp_name,
+              'wandb_group': args.group_name,
+              'wandb_job': args.job_name, }
     training_function(config, args)
 
 
