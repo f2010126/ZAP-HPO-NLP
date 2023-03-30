@@ -2,6 +2,7 @@ import argparse
 from tqdm import tqdm
 import evaluate
 import wandb
+import os
 import torch
 from datasets import load_dataset
 from torch.optim import AdamW
@@ -80,7 +81,7 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 8, model_name = 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
     tokenized_datasets = tokenized_datasets.rename_column("stars", "labels")
-    print('dataset loaded')
+    accelerator.print('dataset loaded')
 
     def collate_fn(examples):
         # On TPU it's best to pad everything to the same length or training will be very slow.
@@ -115,11 +116,18 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 8, model_name = 
 
     return train_dataloader, eval_dataloader, test_dataloader
 
+def set_up_checkpoint():
+    try:
+        os.makedirs("models")
+    except FileExistsError:
+        # directory already exists
+        pass
 
 def training_function(config, args):
     # Initialize accelerator
     accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision, log_with="wandb")
-    # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
+    if accelerator.is_main_process:
+        set_up_checkpoint()
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
     seed = int(config["seed"])
@@ -129,6 +137,9 @@ def training_function(config, args):
     experiment_name = config["exp_name"]
     group = config["wandb_group"]
     job_type = config["wandb_job"]
+    # Helper function for reproducible behavior to set the seed in random, numpy, torch and/or tf
+    set_seed(seed)
+    checkpoint_path = f'./models/{model_name}_checkpoint.pt'
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
@@ -137,7 +148,7 @@ def training_function(config, args):
         batch_size = MAX_GPU_BATCH_SIZE
 
     config['grad_acc'] = gradient_accumulation_steps
-
+    # Init the logging
     accelerator.init_trackers(
             experiment_name,
             config=args,
@@ -151,9 +162,7 @@ def training_function(config, args):
             },
         )
 
-    print('Setting up')
-    # Helper function for reproducible behavior to set the seed in random, numpy, torch and/or tf
-    set_seed(seed)
+    accelerator.print('Setting up')
     train_dataloader, eval_dataloader, test_dataloader = get_dataloaders(accelerator, batch_size, model_name=model_name, dataset=dataset_name, split=args.split_lang)
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
     model_config = AutoConfig.from_pretrained(
@@ -173,26 +182,44 @@ def training_function(config, args):
         num_warmup_steps=100,
         num_training_steps=(len(train_dataloader) * num_epochs) // gradient_accumulation_steps,
     )
+    # which step and epoch to start from
+    ep_step = 0
+    epochs_run = 0
 
+    # Restore model, ep_step, epoch, optimiser, scheduler  from Checkpoint
+    if os.path.exists(checkpoint_path):
+        accelerator.print("Loading snapshot")
+        ckpt = torch.load(checkpoint_path)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
+        epochs_run = ckpt['epoch']
+        ep_step=ckpt['ep_step']
     # Prepare everything
-    # There is no specific order to remember, we just need to unpack the objects in the same order we gave them to the
-    # prepare method.
-    print('Preparing with Accelerate')
+    accelerator.print('Preparing with Accelerate')
     model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader,test_dataloader, lr_scheduler
     )
+    accelerator.register_for_checkpointing(lr_scheduler)
+    accelerator.register_for_checkpointing(optimizer)
+
     # Instantiate training metrics
     metric = evaluate.load("f1")
     train_acc = evaluate.load("accuracy")
     train_f1 = evaluate.load("f1")
-    # Now we train the model
-    print('Training')
-    for epoch in range(num_epochs):
+    # train the model
+    accelerator.print('Training')
+    for epoch in range(epochs_run, num_epochs):
         # Training
+        accelerator.print(f'Epoch {epoch} started')
         model.train()
         with tqdm(total=100, bar_format="{l_bar}{bar} [ time left: {remaining}, time spent: {elapsed}]") as pbar:
 
             for step, batch in tqdm(enumerate(train_dataloader)):
+                # restarting from checkpoint
+                if step < ep_step:
+                    continue
+
                 # We could avoid this line since we set the accelerator with `device_placement=True`.
                 batch.to(accelerator.device)
                 outputs = model(**batch)
@@ -202,24 +229,38 @@ def training_function(config, args):
                 predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
                 train_acc.add_batch(predictions=predictions, references=references)
                 train_f1.add_batch(predictions=predictions, references=references)
-                # loss isnt gathered because we do it manually via gradient accumulation?
+
                 loss = outputs.loss
                 loss = loss / gradient_accumulation_steps
                 # Log the loss and metrics
                 accelerator.log({"train_loss": loss}, step=step)
-                if step % 10 == 0:
-                    accelerator.log({"train_acc": train_acc.compute()['accuracy'],
+                accelerator.log({"train_acc": train_acc.compute()['accuracy'],
                                      "train_f1": train_f1.compute(average="weighted")['f1']}, step=step)
                 accelerator.backward(loss)
+
+
                 if step % gradient_accumulation_steps == 0:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
 
+                if step % 50 == 0 and (accelerator.is_main_process):
+                    # checkpointing
+                    save_model = accelerator.unwrap_model(model)
+                    torch.save({
+                                'ep_step': step,
+                                'epoch': epoch,
+                                'model_state_dict': save_model.state_dict(),
+                                'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                            }, checkpoint_path)
+
+                pbar.update(1)
+
         # Validation
         model.eval()
+        accelerator.print('Validation after epoch')
         for step, batch in tqdm(enumerate(eval_dataloader)):
-            # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch.to(accelerator.device)
             with torch.no_grad():
                 outputs = model(**batch)
@@ -232,10 +273,9 @@ def training_function(config, args):
 
         eval_metric = round(metric.compute(average="weighted")['f1'],5)
         accelerator.log({"eval_metric": eval_metric}, step=epoch)
-        # Use accelerator.print to print only on the main process.
-        accelerator.print(f"epoch {epoch}:", eval_metric)
+        accelerator.print(f"epoch eval {epoch}:", eval_metric)
 
-    print('Testing')
+    accelerator.print('Testing')
     metric = evaluate.load("f1")
     model.eval()
     for step, batch in tqdm(enumerate(test_dataloader)):
